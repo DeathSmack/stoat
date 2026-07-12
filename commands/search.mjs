@@ -26,8 +26,8 @@ export const command = new CommandBuilder()
   .addChoiceOption(o =>
     o.setName("provider")
       .setDescription("The search result provider (YouTube, YouTube Music or SoundCloud). Default: SoundCloud", "options.search.provider")
-      .addChoices("yt", "ytm", "scld")
-      .setDefault("ytm")
+      .addChoices("mono", "yt", "ytm", "scld")
+      .setDefault("mono")
       .addFlagAliases("p", "u", "use"), true)
   .addTextOption(o =>
     o.setName("query")
