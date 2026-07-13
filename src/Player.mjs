@@ -16,6 +16,7 @@ import { Readable, Stream } from "node:stream";
 import { spawn } from "node:child_process";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
+import ProviderManager from "./providers/ProviderManager.mjs";
 
 const MONO_LOG = '/tmp/mono_debug.log';
 const monoLog = (msg) => fs.appendFileSync(MONO_LOG, `[${new Date().toISOString()}] ${msg}\n`);
@@ -26,6 +27,8 @@ try {
 } catch {
   ffmpegPath = (await import("ffmpeg-static")).default;
 }
+
+const providerManager = new ProviderManager();
 
 /**
  * @typedef {Object} Video
@@ -526,57 +529,19 @@ export default class Player extends EventEmitter {
     });
     return buffered;
   }
-  async streamMonochrome(songData) {
-    const SIDECAR_URL = process.env.STREAM_RESOLVER_URL || 'http://127.0.0.1:3100';
+  async streamViaProviders(songData) {
     const trackTitle = songData.title || 'Unknown';
     const artist = songData.author?.name || 'Unknown';
     const duration = songData.duration?.seconds || 0;
 
-    monoLog(`=== streamMonochrome | "${trackTitle}" by ${artist} (${duration}s) ===`);
+    monoLog(`=== streamViaProviders | "${trackTitle}" by ${artist} (${duration}s) ===`);
 
     this.emit("message", "`🔑` Initializing auth sequence...");
 
-    const params = new URLSearchParams({
-      track: trackTitle,
-      artist,
-      album: '',
-      duration: String(duration),
-      quality: 'SD_LOW',
-    });
+    const result = await providerManager.stream(songData, (msg) => this.emit("message", msg));
 
-    let health;
-    try {
-      health = await axios.get(`${SIDECAR_URL}/health`, { timeout: 5000 });
-    } catch {
-      throw new Error('Sidecar offline');
-    }
-
-    if (!health.data?.ready || !health.data?.jwtValid) {
-      monoLog(`[Monochrome] Sidecar not ready: ready=${health.data?.ready} jwtValid=${health.data?.jwtValid}`);
-      throw new Error('Sidecar not ready (no valid auth token)');
-    }
-
-    this.emit("message", "`📡` Querying monochrome relay...");
-
-    let resp;
-    try {
-      resp = await axios.get(`${SIDECAR_URL}/stream?${params.toString()}`, {
-        timeout: 15000
-      });
-    } catch (e) {
-      monoLog(`[Monochrome] Sidecar request failed: ${e.message}`);
-      throw new Error(`Sidecar unavailable: ${e.message}`);
-    }
-
-    if (!resp.data?.streamUrl) {
-      const detail = resp.data?.error || resp.data?.detail || JSON.stringify(resp.data);
-      monoLog(`[Monochrome] Sidecar error: ${detail}`);
-      throw new Error(detail);
-    }
-
-    const streamUrl = resp.data.streamUrl;
-    const decryptionKey = resp.data.decryptionKey || null;
-    monoLog(`Got Amazon stream URL: ${streamUrl.substring(0, 120)} quality=${resp.data.quality} decryptionKey=${decryptionKey ? 'yes' : 'no'}`);
+    const { streamUrl, decryptionKey, isDirectFile, headers: reqHeaders } = result;
+    monoLog(`Got stream from ${result.provider}: ${streamUrl.substring(0, 120)} quality=${result.quality}`);
 
     this.emit("message", "`🎵` Stream acquired, buffering...");
 
@@ -584,10 +549,21 @@ export default class Player extends EventEmitter {
     if (decryptionKey) {
       ffmpegArgs.push('-decryption_key', decryptionKey);
     }
+
+    if (isDirectFile) {
+      ffmpegArgs.push(
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '5',
+      );
+      if (reqHeaders) {
+        for (const [k, v] of Object.entries(reqHeaders)) {
+          ffmpegArgs.push('-headers', `${k}: ${v}\r\n`);
+        }
+      }
+    }
+
     ffmpegArgs.push(
-      '-reconnect', '1',
-      '-reconnect_streamed', '1',
-      '-reconnect_delay_max', '5',
       '-i', streamUrl,
       '-vn',
       '-f', 's16le',
@@ -595,6 +571,7 @@ export default class Player extends EventEmitter {
       '-ac', '2',
       'pipe:1'
     );
+
     const proc = spawn(ffmpegPath, ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
 
     let stderrData = '';
@@ -655,12 +632,12 @@ export default class Player extends EventEmitter {
       streamUrl = songData.url;
     } else if (songData.sourceName === "monochrome" && songData.videoId) {
       try {
-        directStream = await this.streamMonochrome(songData);
+        directStream = await this.streamViaProviders(songData);
         streamUrl = null;
         isEncodedStream = true;
       } catch (e) {
         monoLog(`[Monochrome] Stream failed: ${e.message}`);
-        this.emit("message", "`⚠️` **Relay authentication offline.**\n> The gateway is temporarily unreachable. Stand by.");
+        this.emit("message", "`⚠️` **All relays offline.**\n> No authentication gateways are currently available. Stand by.");
         this.leave();
         return false;
       }

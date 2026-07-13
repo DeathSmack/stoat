@@ -12,6 +12,7 @@ import { Manager } from "moonlink.js";
 import { Dashboard } from "./src/dashboard/Dashboard.mjs";
 import { categories } from "./src/helpCatalog.mjs";
 import { LastFMManager } from "./src/LastFMManager.mjs";
+import ProviderManager from "./src/providers/ProviderManager.mjs";
 
 export class Remix {
   constructor() {
@@ -127,54 +128,56 @@ export class Remix {
   }
 
   startTurnstileMonitor() {
-    const SIDECAR_URL = 'http://127.0.0.1:3100';
     const OWNER_ID = '01JN8AY7K94Y96SAPNM8Y8QEKW';
     const CHECK_INTERVAL = 10 * 60 * 1000;
-    let lastState = null;
+    const pm = new ProviderManager();
+    let lastOnlineCount = -1;
 
     const setPresence = async (presence, text) => {
       try {
         await this.client.user.edit({ status: { presence, text } });
       } catch (e) {
-        console.error('[TurnstileMonitor] Presence update failed:', e.message);
+        console.error('[Monitor] Presence update failed:', e.message);
       }
     };
 
     const check = async () => {
-      try {
-        const resp = await fetch(`${SIDECAR_URL}/health`);
-        const data = await resp.json();
-        const online = data.ready && data.jwtValid;
+      const results = await pm.checkHealth();
+      const onlineCount = pm.getOnlineCount();
+      const total = Object.keys(results).length;
+      const names = Object.entries(results)
+        .filter(([, v]) => v.online)
+        .map(([k]) => k);
 
-        if (online && lastState !== true) {
-          lastState = true;
-          console.log('[TurnstileMonitor] Relay back online! Notifying owner...');
-          await setPresence('Online', 'Relay online');
-          try {
-            const user = await this.client.users.fetch(OWNER_ID);
-            const dm = await user.openDM();
-            await dm.sendMessage('`🟢` **Relay authentication restored.**\n> The monochrome gateway is back online. Fresh token obtained.');
-          } catch (e) {
-            console.error('[TurnstileMonitor] DM failed:', e.message);
-          }
-        } else if (!online && lastState !== false) {
-          lastState = false;
-          console.log('[TurnstileMonitor] Relay offline.');
-          await setPresence('Focus', 'Relay offline');
+      console.log(`[Monitor] Providers: ${onlineCount}/${total} online (${names.join(', ') || 'none'})`);
+
+      if (onlineCount > 0 && lastOnlineCount === 0) {
+        console.log(`[Monitor] Providers back online! Notifying owner...`);
+        await setPresence('Online', `${onlineCount} relay${onlineCount > 1 ? 's' : ''} online`);
+        try {
+          const user = await this.client.users.fetch(OWNER_ID);
+          const dm = await user.openDM();
+          await dm.sendMessage(
+            `\`🟢\` **Relay authentication restored.**\n> ${onlineCount} gateway${onlineCount > 1 ? 's' : ''} available: ${names.join(', ')}`
+          );
+        } catch (e) {
+          console.error('[Monitor] DM failed:', e.message);
         }
-      } catch {
-        if (lastState !== false) {
-          lastState = false;
-          console.log('[TurnstileMonitor] Sidecar unreachable.');
-          await setPresence('Focus', 'Relay offline');
-        }
+      } else if (onlineCount === 0 && lastOnlineCount !== 0) {
+        console.log('[Monitor] All providers offline.');
+        await setPresence('Focus', 'All relays offline');
+      } else {
+        await setPresence(onlineCount > 0 ? 'Online' : 'Focus',
+          onlineCount > 0 ? `${onlineCount} relay${onlineCount > 1 ? 's' : ''} online` : 'All relays offline');
       }
+
+      lastOnlineCount = onlineCount;
     };
 
-    setPresence('Focus', 'Relay offline');
+    setPresence('Focus', 'Checking relays...');
     check();
     setInterval(check, CHECK_INTERVAL);
-    console.log(`[TurnstileMonitor] Checking relay every ${CHECK_INTERVAL / 60000}min`);
+    console.log(`[Monitor] Checking providers every ${CHECK_INTERVAL / 60000}min`);
   }
 
   getSettings(message) {
