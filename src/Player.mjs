@@ -13,6 +13,19 @@ import axios from "axios";
 import { PassThrough } from "stream";
 import { Channel } from "./MessageHandler.mjs";
 import { Readable, Stream } from "node:stream";
+import { spawn } from "node:child_process";
+import { execSync } from "node:child_process";
+import fs from "node:fs";
+
+const MONO_LOG = '/tmp/mono_debug.log';
+const monoLog = (msg) => fs.appendFileSync(MONO_LOG, `[${new Date().toISOString()}] ${msg}\n`);
+
+let ffmpegPath;
+try {
+  ffmpegPath = execSync("which ffmpeg", { encoding: "utf8" }).trim();
+} catch {
+  ffmpegPath = (await import("ffmpeg-static")).default;
+}
 
 /**
  * @typedef {Object} Video
@@ -513,6 +526,70 @@ export default class Player extends EventEmitter {
     });
     return buffered;
   }
+  async streamMonochrome(songData) {
+    const SIDECAR_URL = process.env.STREAM_RESOLVER_URL || 'http://127.0.0.1:3100';
+    const trackTitle = songData.title || 'Unknown';
+    const artist = songData.author?.name || 'Unknown';
+    const duration = songData.duration?.seconds || 0;
+
+    monoLog(`=== streamMonochrome | "${trackTitle}" by ${artist} (${duration}s) ===`);
+
+    // Get stream URL from sidecar (Amazon Music via Turnstile)
+    const params = new URLSearchParams({
+      track: trackTitle,
+      artist,
+      album: '',
+      duration: String(duration),
+      quality: 'SD_LOW',
+    });
+
+    const resp = await axios.get(`${SIDECAR_URL}/stream?${params.toString()}`, {
+      timeout: 15000
+    });
+
+    if (!resp.data?.streamUrl) {
+      throw new Error(`Sidecar returned no URL: ${JSON.stringify(resp.data)}`);
+    }
+
+    const streamUrl = resp.data.streamUrl;
+    const decryptionKey = resp.data.decryptionKey || null;
+    monoLog(`Got Amazon stream URL: ${streamUrl.substring(0, 120)} quality=${resp.data.quality} decryptionKey=${decryptionKey ? 'yes' : 'no'}`);
+
+    // ffmpeg: download MP4 → raw PCM s16le for LiveKit
+    const ffmpegArgs = [];
+    if (decryptionKey) {
+      ffmpegArgs.push('-decryption_key', decryptionKey);
+    }
+    ffmpegArgs.push(
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_delay_max', '5',
+      '-i', streamUrl,
+      '-vn',
+      '-f', 's16le',
+      '-ar', '48000',
+      '-ac', '2',
+      'pipe:1'
+    );
+    const proc = spawn(ffmpegPath, ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    let stderrData = '';
+    proc.stderr.on('data', (d) => { stderrData += d.toString(); });
+
+    proc.on('error', (err) => {
+      monoLog(`[ERROR] ffmpeg spawn error: ${err.message}`);
+    });
+
+    proc.on('exit', (code, signal) => {
+      monoLog(`[EXIT] ffmpeg code=${code} signal=${signal}`);
+      if (stderrData) monoLog(`[STDERR last 500]: ${stderrData.slice(-500)}`);
+    });
+
+    const buffered = new PassThrough({ highWaterMark: 256 * 1024 });
+    proc.stdout.pipe(buffered);
+    proc.stdout.on('error', (err) => buffered.destroy(err));
+    return buffered;
+  }
   /**
    *Waits for a NodeLink node to become ready
    * @returns {Promise<undefined>}
@@ -549,8 +626,23 @@ export default class Player extends EventEmitter {
     const connection = this.voice.getVoiceConnection(this.connection.channelId);
     var streamUrl;
     var directStream;
+    var isEncodedStream = false;
     if (songData.type == "external" || songData.type == "radio") {
       streamUrl = songData.url;
+    } else if (songData.sourceName === "monochrome" && songData.videoId) {
+      try {
+        directStream = await this.streamMonochrome(songData);
+        streamUrl = null;
+        isEncodedStream = true;
+      } catch (e) {
+        console.error("[Monochrome] Fallback to loadDirectStream:", e.message);
+        const node = await this.getNode();
+        const load = (await node.loadDirectStream({
+          encoded: songData.encoded
+        }, 100, 0));
+        streamUrl = null;
+        directStream = load.stream;
+      }
     } else if (songData.encoded) {
       const node = await this.getNode();
       const load = (await node.loadDirectStream({
@@ -568,11 +660,72 @@ export default class Player extends EventEmitter {
     }
 
     connection.media.once("startplay", () => this.emit("streamStartPlay", Date.now()));
-    connection.media.playStream(stream, (!streamUrl) ? [
-            `-f s16le`,
-            `-ar 48000`,
-            `-ac 2`
-          ] : undefined);
+    if (isEncodedStream && directStream) {
+      connection.media.emit("buffer");
+      connection.media.originStream = directStream;
+      connection.media.ffmpegFinished = false;
+      connection.media.playedOutSamples = 0;
+      connection.media.rawPCMMode = true;
+      connection.media._playStartTime = null;
+
+      let started = false;
+      let preBufferChunks = [];
+      const PRE_BUFFER_SECONDS = 5;
+      const BYTES_PER_SEC = 48000 * 2 * 2;
+      let totalPushed = 0;
+      let drainTicks = 0;
+
+      const drainLoop = setInterval(() => {
+        if (!connection.media.originStream) {
+          monoLog(`[DRAIN] originStream gone, stopping drain`);
+          clearInterval(drainLoop);
+          return;
+        }
+        drainTicks++;
+        if (connection.media.chunks.length > 0 && connection.media.readyPlayPacket && !connection.media.paused) {
+          connection.media.playOutPacket();
+        }
+        if (drainTicks % 200 === 0) {
+          monoLog(`[DRAIN] tick=${drainTicks} chunks=${connection.media.chunks.length} playedOut=${connection.media.playedOutSamples} ready=${connection.media.readyPlayPacket} ffmpegDone=${connection.media.ffmpegFinished}`);
+        }
+      }, 5);
+
+      directStream.on("data", (chunk) => {
+        if (!started) {
+          preBufferChunks.push(chunk);
+          const bufferedBytes = preBufferChunks.reduce((sum, c) => sum + c.length, 0);
+          if (bufferedBytes >= BYTES_PER_SEC * PRE_BUFFER_SECONDS) {
+            started = true;
+            monoLog(`[PREBUFFER] ready: ${preBufferChunks.length} chunks, ${bufferedBytes} bytes`);
+            for (const c of preBufferChunks) connection.media.chunks.push(c);
+            preBufferChunks = null;
+            connection.media.playing = true;
+            connection.media.emit("startplay");
+            connection.media.playOutPacket();
+          }
+        } else {
+          connection.media.chunks.push(chunk);
+          totalPushed += chunk.length;
+        }
+      });
+
+      directStream.on("end", () => {
+        monoLog(`[STREAM END] ffmpegFinished=${connection.media.ffmpegFinished} chunks_left=${connection.media.chunks.length} pushed=${totalPushed}`);
+        connection.media.ffmpegFinished = true;
+        // Don't clear drain loop — let it drain remaining chunks
+      });
+
+      directStream.on("error", (err) => {
+        monoLog(`[STREAM ERROR] ${err.message}`);
+        clearInterval(drainLoop);
+      });
+    } else {
+      connection.media.playStream(stream, (!streamUrl) ? [
+              `-f s16le`,
+              `-ar 48000`,
+              `-ac 2`
+            ] : undefined);
+    }
     stream.once("data", () => this.startedPlaying = Date.now());
     if (this.connection.preferredVolume) connection.media.setVolume(this.connection.preferredVolume);
     this.announceSong(songData);
