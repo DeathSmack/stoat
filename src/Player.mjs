@@ -534,7 +534,8 @@ export default class Player extends EventEmitter {
 
     monoLog(`=== streamMonochrome | "${trackTitle}" by ${artist} (${duration}s) ===`);
 
-    // Get stream URL from sidecar (Amazon Music via Turnstile)
+    this.emit("message", "`🔑` Initializing auth sequence...");
+
     const params = new URLSearchParams({
       track: trackTitle,
       artist,
@@ -543,19 +544,42 @@ export default class Player extends EventEmitter {
       quality: 'SD_LOW',
     });
 
-    const resp = await axios.get(`${SIDECAR_URL}/stream?${params.toString()}`, {
-      timeout: 15000
-    });
+    let health;
+    try {
+      health = await axios.get(`${SIDECAR_URL}/health`, { timeout: 5000 });
+    } catch {
+      throw new Error('Sidecar offline');
+    }
+
+    if (!health.data?.ready || !health.data?.jwtValid) {
+      monoLog(`[Monochrome] Sidecar not ready: ready=${health.data?.ready} jwtValid=${health.data?.jwtValid}`);
+      throw new Error('Sidecar not ready (no valid auth token)');
+    }
+
+    this.emit("message", "`📡` Querying monochrome relay...");
+
+    let resp;
+    try {
+      resp = await axios.get(`${SIDECAR_URL}/stream?${params.toString()}`, {
+        timeout: 15000
+      });
+    } catch (e) {
+      monoLog(`[Monochrome] Sidecar request failed: ${e.message}`);
+      throw new Error(`Sidecar unavailable: ${e.message}`);
+    }
 
     if (!resp.data?.streamUrl) {
-      throw new Error(`Sidecar returned no URL: ${JSON.stringify(resp.data)}`);
+      const detail = resp.data?.error || resp.data?.detail || JSON.stringify(resp.data);
+      monoLog(`[Monochrome] Sidecar error: ${detail}`);
+      throw new Error(detail);
     }
 
     const streamUrl = resp.data.streamUrl;
     const decryptionKey = resp.data.decryptionKey || null;
     monoLog(`Got Amazon stream URL: ${streamUrl.substring(0, 120)} quality=${resp.data.quality} decryptionKey=${decryptionKey ? 'yes' : 'no'}`);
 
-    // ffmpeg: download MP4 → raw PCM s16le for LiveKit
+    this.emit("message", "`🎵` Stream acquired, buffering...");
+
     const ffmpegArgs = [];
     if (decryptionKey) {
       ffmpegArgs.push('-decryption_key', decryptionKey);
@@ -635,13 +659,10 @@ export default class Player extends EventEmitter {
         streamUrl = null;
         isEncodedStream = true;
       } catch (e) {
-        console.error("[Monochrome] Fallback to loadDirectStream:", e.message);
-        const node = await this.getNode();
-        const load = (await node.loadDirectStream({
-          encoded: songData.encoded
-        }, 100, 0));
-        streamUrl = null;
-        directStream = load.stream;
+        monoLog(`[Monochrome] Stream failed: ${e.message}`);
+        this.emit("message", "`⚠️` **Relay authentication offline.**\n> The gateway is temporarily unreachable. Stand by.");
+        this.leave();
+        return false;
       }
     } else if (songData.encoded) {
       const node = await this.getNode();
