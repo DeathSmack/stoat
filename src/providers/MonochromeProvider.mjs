@@ -17,6 +17,19 @@ export default class MonochromeProvider {
     }
   }
 
+  async refresh() {
+    try {
+      log('Requesting JWT refresh from sidecar...');
+      const resp = await axios.get(`${this.sidecarUrl}/refresh`, { timeout: 30000 });
+      const ok = resp.data?.ok;
+      log(`Refresh result: ok=${ok} jwtValid=${resp.data?.jwtValid}`);
+      return ok;
+    } catch (e) {
+      log(`Refresh failed: ${e.message}`);
+      return false;
+    }
+  }
+
   async stream(songData) {
     const trackTitle = songData.title || 'Unknown';
     const artist = songData.author?.name || 'Unknown';
