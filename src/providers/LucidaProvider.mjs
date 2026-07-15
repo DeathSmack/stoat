@@ -17,10 +17,14 @@ export default class LucidaProvider {
           maxRedirects: 0,
           validateStatus: (s) => s < 500,
         });
-        if (resp.status === 200 || resp.status === 301 || resp.status === 302) {
+        const html = typeof resp.data === 'string' ? resp.data : '';
+        if (html.includes('challenge-platform') || html.includes('Just a moment')) {
+          return { online: false, details: `Cloudflare challenge (${base})` };
+        }
+        if (resp.status === 200 && html.includes('token:')) {
           return { online: true, details: base };
         }
-        return { online: false, details: `HTTP ${resp.status}` };
+        return { online: false, details: `HTTP ${resp.status} (${base})` };
       } catch (e) {
         continue;
       }

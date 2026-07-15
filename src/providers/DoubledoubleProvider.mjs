@@ -15,6 +15,10 @@ export default class DoubledoubleProvider {
     for (const region of REGIONS) {
       try {
         const resp = await axios.get(region.base, { timeout: 8000, maxRedirects: 0, validateStatus: (s) => s < 500 });
+        const html = typeof resp.data === 'string' ? resp.data : '';
+        if (html.includes('hcaptcha') || html.includes('captcha') || html.includes('challenge-platform')) {
+          return { online: false, details: `CAPTCHA required (${region.name})` };
+        }
         if (resp.status === 200) {
           return { online: true, details: region.name };
         }

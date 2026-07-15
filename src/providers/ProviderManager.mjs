@@ -1,5 +1,4 @@
 import MonochromeProvider from './MonochromeProvider.mjs';
-import LucidaProvider from './LucidaProvider.mjs';
 import DoubledoubleProvider from './DoubledoubleProvider.mjs';
 
 const log = (msg) => console.log(`[ProviderManager] ${msg}`);
@@ -12,7 +11,6 @@ export default class ProviderManager {
   constructor() {
     this.providers = [
       new MonochromeProvider(),
-      new LucidaProvider(),
       new DoubledoubleProvider(),
     ];
     log(`Initialized ${this.providers.length} providers: ${this.providers.map(p => p.displayName).join(', ')}`);
