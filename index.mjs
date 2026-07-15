@@ -131,6 +131,7 @@ export class Remix {
     const OWNER_ID = '01JN8AY7K94Y96SAPNM8Y8QEKW';
     const CHECK_INTERVAL = 10 * 60 * 1000;
     const pm = new ProviderManager();
+    this.pm = pm;
     let lastOnlineCount = -1;
 
     const setPresence = async (presence, text) => {

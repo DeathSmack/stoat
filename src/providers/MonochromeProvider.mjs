@@ -6,12 +6,42 @@ export default class MonochromeProvider {
   name = 'monochrome';
   displayName = 'Monochrome';
   sidecarUrl = process.env.STREAM_RESOLVER_URL || 'http://127.0.0.1:3100';
+  lastManualJwtAt = 0;
+  REFRESH_COOLDOWN = 2 * 60 * 1000;
+
+  markJwtValid() {
+    this.lastManualJwtAt = Date.now();
+    log('Manual JWT set — skipping auto-refresh for cooldown');
+  }
 
   async health() {
     try {
       const resp = await axios.get(`${this.sidecarUrl}/health`, { timeout: 5000 });
       const { ready, jwtValid } = resp.data || {};
-      return { online: !!(ready && jwtValid), details: `ready=${ready} jwtValid=${jwtValid}` };
+
+      if (ready && jwtValid) {
+        return { online: true, details: `ready=${ready} jwtValid=${jwtValid}` };
+      }
+
+      if (Date.now() - this.lastManualJwtAt < this.REFRESH_COOLDOWN) {
+        log('JWT invalid but within manual cooldown — waiting');
+        return { online: false, details: `ready=${ready} jwtValid=${jwtValid} (cooldown)` };
+      }
+
+      if (ready && !jwtValid) {
+        log('JWT missing/expired — attempting auto-refresh...');
+        const refreshed = await this.refresh();
+        if (refreshed) {
+          const recheck = await axios.get(`${this.sidecarUrl}/health`, { timeout: 5000 });
+          const { jwtValid: afterRefresh } = recheck.data || {};
+          if (afterRefresh) {
+            return { online: true, details: `refreshed jwtValid=true` };
+          }
+        }
+        return { online: false, details: `refresh failed ready=${ready} jwtValid=${jwtValid}` };
+      }
+
+      return { online: false, details: `ready=${ready} jwtValid=${jwtValid}` };
     } catch (e) {
       return { online: false, details: e.message };
     }

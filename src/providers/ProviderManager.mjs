@@ -46,6 +46,15 @@ export default class ProviderManager {
     return this.getHealthyProviders().length;
   }
 
+  invalidateHealth(name) {
+    this.healthCache.delete(name);
+  }
+
+  async forceCheck() {
+    this.healthCache.clear();
+    return this.checkHealth();
+  }
+
   getProviderStatus() {
     return this.providers.map(p => {
       const cached = this.healthCache.get(p.name);

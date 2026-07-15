@@ -51,6 +51,32 @@ export const run = async function (msg, data) {
         false,
         { colour: "green" }
       );
+
+      if (this.pm) {
+        const monochrome = this.pm.providers.find(p => p.name === 'monochrome');
+        if (monochrome) monochrome.markJwtValid();
+        this.pm.invalidateHealth('monochrome');
+        const results = await this.pm.forceCheck();
+        const onlineCount = this.pm.getOnlineCount();
+        const names = Object.entries(results)
+          .filter(([, v]) => v.online)
+          .map(([k]) => k);
+
+        try {
+          await this.client.user.edit({
+            status: {
+              presence: onlineCount > 0 ? 'Online' : 'Focus',
+              text: onlineCount > 0
+                ? `${onlineCount} relay${onlineCount > 1 ? 's' : ''} online`
+                : 'All relays offline'
+            }
+          });
+        } catch (e) {
+          console.error('[JWT] Presence update failed:', e.message);
+        }
+
+        console.log(`[JWT] Health recheck: ${onlineCount}/${results.length} online (${names.join(', ') || 'none'})`);
+      }
     } else {
       msg.replyEmbed(
         `Failed to set JWT: \`${result.error}\``,
