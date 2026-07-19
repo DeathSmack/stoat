@@ -502,16 +502,22 @@ export default class Player extends EventEmitter {
 
   // functional core
   // TODO: potentially touch up the following parts as well
-  async streamResource(url) {
-    const response = await axios({ method: 'get', url: url, responseType: 'stream' });
-    const buffered = new PassThrough({
-      highWaterMark: 10 * 1024 * 1024,
-    });
-    response.data.pipe(buffered);
-    response.data.on("error", (err) => {
-      buffered.destroy(err);
-    });
-    return buffered;
+  async streamResource(url, retries = 3) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        const response = await axios({ method: 'get', url: url, responseType: 'stream', timeout: 30000 });
+        const buffered = new PassThrough({
+          highWaterMark: 10 * 1024 * 1024,
+        });
+        response.data.pipe(buffered);
+        response.data.on("error", (err) => buffered.destroy(err));
+        return buffered;
+      } catch (err) {
+        if (attempt === retries) throw err;
+        console.error("[Player] streamResource attempt " + attempt + " failed: " + err.message + ". Retrying...");
+        await new Promise(r => setTimeout(r, attempt * 2000));
+      }
+    }
   }
   /**
    *Waits for a NodeLink node to become ready
@@ -560,7 +566,23 @@ export default class Player extends EventEmitter {
       directStream = load.stream;
     }
 
-    const stream = (streamUrl) ? await this.streamResource(streamUrl) : directStream;
+    var stream;
+    if (streamUrl) {
+      try {
+        stream = await this.streamResource(streamUrl);
+      } catch (err) {
+        console.error("[Player] Failed to stream resource: " + err.message);
+        if (songData.type === "radio") {
+          console.log("[Player] Radio stream failed, will retry in 5s...");
+          await new Promise(r => setTimeout(r, 5000));
+          return this.playNext();
+        }
+        this.emit("stopplay");
+        return false;
+      }
+    } else {
+      stream = directStream;
+    }
 
     if (!stream) {
       this.emit("stopplay");
@@ -574,6 +596,15 @@ export default class Player extends EventEmitter {
             `-ac 2`
           ] : undefined);
     stream.once("data", () => this.startedPlaying = Date.now());
+    if (songData.type === "radio") {
+      const reconnectRadio = () => {
+        console.log("[Player] Radio stream ended, reconnecting in 3s...");
+        setTimeout(() => this.playNext(), 3000);
+      };
+      stream.on("end", reconnectRadio);
+      stream.on("close", reconnectRadio);
+      stream.on("error", reconnectRadio);
+    }
     if (this.connection.preferredVolume) connection.media.setVolume(this.connection.preferredVolume);
     this.announceSong(songData);
     this.emit("startplay", songData);
